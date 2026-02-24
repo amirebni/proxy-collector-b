@@ -1,0 +1,109 @@
+name: Proxy Collector B
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 */3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install tools
+        run: |
+          sudo apt update
+          sudo apt install -y curl jq coreutils netcat-openbsd
+
+      - name: Fetch Registry
+        run: |
+          curl -s https://raw.githubusercontent.com/amirebni/proxy-registry/main/registry.json -o registry.json
+
+      - name: Extract Shard Sources
+        run: |
+          jq -r '.shards["collector-b"][]' registry.json > sources.txt
+          echo "Loaded sources:"
+          cat sources.txt
+
+      - name: Collect + Safe Decode
+        run: |
+          rm -f merged.txt
+          touch merged.txt
+
+          while read url; do
+            [ -z "$url" ] && continue
+            echo "Downloading $url"
+
+            content=$(curl -L -s --max-time 15 "$url" || echo "")
+
+            if [ -z "$content" ]; then
+              echo "Failed or empty: $url"
+              continue
+            fi
+
+            decoded=$(echo "$content" | base64 -d 2>/dev/null || echo "__DECODE_FAIL__")
+
+            if [ "$decoded" = "__DECODE_FAIL__" ]; then
+              decoded="$content"
+            fi
+
+            echo "$decoded" >> merged.txt
+            echo "" >> merged.txt
+
+          done < sources.txt
+
+      - name: Extract Valid Protocol Lines
+        run: |
+          grep -E '^(vmess|vless|trojan|ss|ssr|hy2|tuic)://' merged.txt > extracted.txt || true
+          sort -u extracted.txt -o extracted.txt
+
+          head -n 3000 extracted.txt > limited.txt
+          mv limited.txt extracted.txt
+
+          echo "Total extracted (limited):"
+          wc -l extracted.txt
+
+      - name: TCP + Latency Test
+        run: |
+          rm -f alive.txt
+          touch alive.txt
+
+          cat extracted.txt | xargs -I {} -P 40 bash -c '
+            line="{}"
+            hp=$(echo "$line" | grep -oE "[a-zA-Z0-9\.-]+:[0-9]+" | head -n1)
+
+            if [ -n "$hp" ]; then
+              host=$(echo $hp | cut -d":" -f1)
+              port=$(echo $hp | cut -d":" -f2)
+
+              start=$(date +%s%3N)
+              timeout 4 nc -z $host $port 2>/dev/null
+              if [ $? -eq 0 ]; then
+                end=$(date +%s%3N)
+                latency=$((end - start))
+                echo "${line}#${latency}ms|collector-b" >> alive.txt
+              fi
+            fi
+          ' || true
+
+          echo "Alive count:"
+          wc -l alive.txt
+
+      - name: Sort by Latency
+        run: |
+          sort -t '#' -k2 -n alive.txt -o alive.txt
+
+      - name: Commit Results
+        run: |
+          git config --global user.name "collector-b-bot"
+          git config --global user.email "bot@github.com"
+          git add alive.txt
+          git commit -m "update alive list" || echo "No changes"
+          git push || true
