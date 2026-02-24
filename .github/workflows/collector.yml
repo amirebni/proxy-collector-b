@@ -1,9 +1,9 @@
-name: Proxy Collector B
+name: Universal Collector B
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "45 */3 * * *"
+    - cron: "45 3,11,19 * * *"
 
 permissions:
   contents: write
@@ -11,31 +11,31 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Install tools
+      - name: Install basic tools
         run: |
           sudo apt update
-          sudo apt install -y curl jq coreutils
+          sudo apt install -y curl jq netcat-openbsd
 
       - name: Fetch Registry
         run: |
           curl -s https://raw.githubusercontent.com/punez/proxy-registry/main/registry.json -o registry.json
 
-      - name: Extract Shard Sources
+      - name: Extract Sources
         run: |
           jq -r '.shards["collector-b"][]' registry.json > sources.txt
-          echo "Loaded sources:"
+          echo "Sources loaded:"
           cat sources.txt
 
-      - name: Collect + Multi Decode
+      - name: Collect Everything
         run: |
-          rm -f merged.txt
-          touch merged.txt
+          rm -f merged_raw.txt
+          touch merged_raw.txt
 
           while read url; do
             [ -z "$url" ] && continue
@@ -45,31 +45,61 @@ jobs:
 
             [ -z "$content" ] && continue
 
-            echo "$content" >> merged.txt
+            echo "$content" >> merged_raw.txt
+            echo "" >> merged_raw.txt
 
-            # Try base64 decode
             decoded=$(echo "$content" | base64 -d 2>/dev/null || echo "")
             if [ -n "$decoded" ]; then
-              echo "$decoded" >> merged.txt
+              echo "$decoded" >> merged_raw.txt
+              echo "" >> merged_raw.txt
             fi
 
           done < sources.txt
 
-      - name: Extract Valid Protocol Lines (Robust)
+      - name: Extract All Possible Links
         run: |
-          grep -aEo '(vmess|vless|trojan|ss|ssr|hy2|tuic)://[^"]+' merged.txt > extracted.txt || true
+          rm -f extracted.txt
+          touch extracted.txt
+
+          grep -aEo '(vmess|vless|trojan|ss|ssr|hy2|tuic)://[^"]+' merged_raw.txt >> extracted.txt || true
+
+          jq -r '..|strings?' merged_raw.txt 2>/dev/null | \
+          grep -aE '(vmess|vless|trojan|ss|ssr|hy2|tuic)://' >> extracted.txt || true
 
           sort -u extracted.txt -o extracted.txt
-          head -n 5000 extracted.txt > limited.txt
-          mv limited.txt extracted.txt
 
           echo "Total extracted:"
           wc -l extracted.txt
 
-      - name: Commit Results
+      - name: TCP Alive Test (Simple)
+        run: |
+          rm -f alive.txt
+          touch alive.txt
+
+          cat extracted.txt | xargs -I {} -P 50 bash -c '
+            line="{}"
+            hp=$(echo "$line" | grep -oE "[a-zA-Z0-9\.-]+:[0-9]+" | head -n1)
+
+            if [ -n "$hp" ]; then
+              host=$(echo $hp | cut -d":" -f1)
+              port=$(echo $hp | cut -d":" -f2)
+
+              timeout 3 nc -z $host $port 2>/dev/null
+              if [ $? -eq 0 ]; then
+                echo "$line" >> alive.txt
+              fi
+            fi
+          ' || true
+
+          sort -u alive.txt -o alive.txt
+
+          echo "Alive count:"
+          wc -l alive.txt
+
+      - name: Commit Alive
         run: |
           git config --global user.name "collector-b-bot"
           git config --global user.email "bot@github.com"
-          git add extracted.txt
-          git commit -m "update extracted list" || echo "No changes"
+          git add alive.txt
+          git commit -m "update alive list" || echo "No changes"
           git push || true
